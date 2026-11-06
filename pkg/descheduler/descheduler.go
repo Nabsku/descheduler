@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	fakeclientset "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/events"
 	componentbaseconfig "k8s.io/component-base/config"
 	"k8s.io/klog/v2"
@@ -126,6 +127,7 @@ func newDescheduler(ctx context.Context, rs *options.DeschedulerServer, deschedu
 	// Temporarily register the PVC because it is used by the DefaultEvictor plugin during
 	// the descheduling cycle, where informer registration is ignored.
 	_ = sharedInformerFactory.Core().V1().PersistentVolumeClaims().Informer()
+	_ = sharedInformerFactory.Policy().V1().PodDisruptionBudgets().Informer()
 
 	getPodsAssignedToNode, err := podutil.BuildGetPodsAssignedToNodeFunc(podInformer)
 	if err != nil {
@@ -438,9 +440,8 @@ func bootstrapDescheduler(
 	// init is responsible for starting all informer factories, metrics providers
 	// and other parts that require to start before a first descheduling cycle is run
 	deschedulerInitFnc := func(ctx context.Context) error {
-		// In dry run mode, start and sync the fake shared informer factory so it can mirror
-		// events from the real factory. Reliable propagation depends on both factories being
-		// fully synced (see WaitForCacheSync calls below), not solely on startup order.
+		// Keep the fake watcher running while the real informer seeds the sandbox;
+		// a fake List/Watch gap can otherwise miss deletions during startup.
 		if rs.DryRun {
 			descheduler.kubeClientSandbox.fakeSharedInformerFactory().Start(ctx.Done())
 			descheduler.kubeClientSandbox.fakeSharedInformerFactory().WaitForCacheSync(ctx.Done())
@@ -451,6 +452,16 @@ func bootstrapDescheduler(
 		}
 
 		sharedInformerFactory.WaitForCacheSync(ctx.Done())
+		if rs.DryRun {
+			if !cache.WaitForCacheSync(ctx.Done(), descheduler.kubeClientSandbox.mirrorHasSynced...) {
+				return fmt.Errorf("dry-run sandbox mirror did not sync")
+			}
+			if err := wait.PollUntilContextCancel(ctx, 100*time.Millisecond, true, func(context.Context) (bool, error) {
+				return descheduler.kubeClientSandbox.mirrorsInSync()
+			}); err != nil {
+				return fmt.Errorf("dry-run sandbox cache did not catch up: %w", err)
+			}
+		}
 		if descheduler.secretBasedPromClientCtrl != nil {
 			namespacedSharedInformerFactory.WaitForCacheSync(ctx.Done())
 		}

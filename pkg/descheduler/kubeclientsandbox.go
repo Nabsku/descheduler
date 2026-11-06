@@ -91,6 +91,7 @@ type kubeClientSandbox struct {
 	fakeKubeClient         *fakeclientset.Clientset
 	fakeFactory            informers.SharedInformerFactory
 	resourceToInformer     map[schema.GroupVersionResource]informers.GenericInformer
+	mirrorHasSynced        []cache.InformerSynced
 	evictedPodsCache       *evictedPodsCache
 	podEvictionReactionFnc func(*fakeclientset.Clientset, *evictedPodsCache) func(action core.Action) (bool, runtime.Object, error)
 }
@@ -145,7 +146,7 @@ func (sandbox *kubeClientSandbox) registerEventHandlers() error {
 			return fmt.Errorf("error getting resource %s for fake factory: %w", resource, err)
 		}
 
-		_, err = informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		registration, err := informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
 				runtimeObj, ok := obj.(runtime.Object)
 				if !ok {
@@ -197,6 +198,7 @@ func (sandbox *kubeClientSandbox) registerEventHandlers() error {
 		if err != nil {
 			return fmt.Errorf("error adding event handler for resource %s: %w", resource, err)
 		}
+		sandbox.mirrorHasSynced = append(sandbox.mirrorHasSynced, registration.HasSynced)
 	}
 	return nil
 }
@@ -207,6 +209,47 @@ func (sandbox *kubeClientSandbox) fakeClient() *fakeclientset.Clientset {
 
 func (sandbox *kubeClientSandbox) fakeSharedInformerFactory() informers.SharedInformerFactory {
 	return sandbox.fakeFactory
+}
+
+// mirrorsInSync checks the informer caches, not just the fake client's tracker:
+// tracker writes can still be queued behind the fake informer's initial sync.
+func (sandbox *kubeClientSandbox) mirrorsInSync() (bool, error) {
+	for resource, realInformer := range sandbox.resourceToInformer {
+		fakeInformer, err := sandbox.fakeFactory.ForResource(resource)
+		if err != nil {
+			return false, fmt.Errorf("get fake informer for %s: %w", resource, err)
+		}
+		fakeIndexer := fakeInformer.Informer().GetIndexer()
+		realObjects := realInformer.Informer().GetIndexer().List()
+		if len(realObjects) != len(fakeIndexer.List()) {
+			return false, nil
+		}
+		for _, realObj := range realObjects {
+			key, err := cache.MetaNamespaceKeyFunc(realObj)
+			if err != nil {
+				return false, fmt.Errorf("get real object key for %s: %w", resource, err)
+			}
+			fakeObj, exists, err := fakeIndexer.GetByKey(key)
+			if err != nil {
+				return false, fmt.Errorf("get fake object %s for %s: %w", key, resource, err)
+			}
+			if !exists {
+				return false, nil
+			}
+			realMeta, err := meta.Accessor(realObj)
+			if err != nil {
+				return false, fmt.Errorf("get real object metadata for %s: %w", resource, err)
+			}
+			fakeMeta, err := meta.Accessor(fakeObj)
+			if err != nil {
+				return false, fmt.Errorf("get fake object metadata for %s: %w", resource, err)
+			}
+			if realMeta.GetUID() != fakeMeta.GetUID() || realMeta.GetResourceVersion() != fakeMeta.GetResourceVersion() {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
 }
 
 func (sandbox *kubeClientSandbox) reset() {
